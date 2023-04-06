@@ -176,7 +176,8 @@ def main():
 
     logger.info("param size = %fMB", util.count_parameters_in_MB(model))
     optimizer = config.optimizer(model.parameters())
-    scheduler = config.scheduler(optimizer)
+    #scheduler = config.scheduler(optimizer) #modify the scheduler
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 120, 160], gamma=0.1)
     criterion = config.criterion()
     trainer = Trainer(criterion, data_loader, logger, config, target=train_target)
     evaluator = Evaluator(data_loader, logger, config)

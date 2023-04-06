@@ -1,11 +1,21 @@
 import numpy as np
 import torch
 from torch.autograd import Variable
+import copy
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
 else:
     device = torch.device('cpu')
+    
+def add_gaussian2(model, sigma=0.05):
+    with torch.no_grad():
+        for _, param in model.named_parameters():
+            param_size = param.size()
+            mean_param = torch.zeros(param_size, device=device)
+            std_param = sigma * torch.ones(param_size, device=device)
+            gaussian_noise = torch.normal(mean_param, std_param)
+            param.add_(gaussian_noise)
 
 
 class PerturbationTool():
@@ -21,6 +31,7 @@ class PerturbationTool():
         return random_noise
 
     def min_min_attack(self, images, labels, model, optimizer, criterion, random_noise=None, sample_wise=False):
+        # modify the loss
         if random_noise is None:
             random_noise = torch.FloatTensor(*images.shape).uniform_(-self.epsilon, self.epsilon).to(device)
 
@@ -34,10 +45,18 @@ class PerturbationTool():
             if isinstance(criterion, torch.nn.CrossEntropyLoss):
                 if hasattr(model, 'classify'):
                     model.classify = True
-                logits = model(perturb_img)
-                loss = criterion(logits, labels)
+                # logits = model(perturb_img)
+                # loss = criterion(logits, labels)
+                loss = 0
+                for _ in range(20): #estimate expected loss
+                    net_clone = copy.deepcopy(model).to(device)
+                    add_gaussian2(net_clone) #add gaussian noise to model parameters
+                    output_p = net_clone(perturb_img)
+                    loss_s = criterion(output_p, labels)
+                    loss += loss_s
+                loss = loss/20
             else:
-                logits, loss = criterion(model, perturb_img, labels, optimizer)
+                logits, loss = criterion(model, perturb_img, labels, optimizer) #modify
             perturb_img.retain_grad()
             loss.backward()
             eta = self.step_size * perturb_img.grad.data.sign() * (-1)

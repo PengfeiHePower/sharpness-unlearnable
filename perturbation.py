@@ -14,6 +14,7 @@ import numpy as np
 from evaluator import Evaluator
 from tqdm import tqdm
 from trainer import Trainer
+import copy
 mlconfig.register(madrys.MadrysLoss)
 
 # General Options
@@ -25,7 +26,7 @@ parser.add_argument('--config_path', type=str, default='configs/cifar10')
 parser.add_argument('--load_model', action='store_true', default=False)
 parser.add_argument('--data_parallel', action='store_true', default=False)
 # Datasets Options
-parser.add_argument('--train_batch_size', default=512, type=int, help='perturb step size')
+parser.add_argument('--train_batch_size', default=256, type=int, help='perturb step size')
 parser.add_argument('--eval_batch_size', default=512, type=int, help='perturb step size')
 parser.add_argument('--num_of_workers', default=8, type=int, help='workers for loader')
 parser.add_argument('--train_data_type', type=str, default='CIFAR10')
@@ -46,6 +47,7 @@ parser.add_argument('--epsilon', default=8, type=float, help='perturbation')
 parser.add_argument('--num_steps', default=1, type=int, help='perturb number of steps')
 parser.add_argument('--step_size', default=0.8, type=float, help='perturb step size')
 parser.add_argument('--random_start', action='store_true', default=False)
+parser.add_argument('--epochs', default = 100, type=int, help='crafting epochs')
 args = parser.parse_args()
 
 # Convert Eps
@@ -83,6 +85,15 @@ config.set_immutable()
 for key in config:
     logger.info("%s: %s" % (key, config[key]))
 shutil.copyfile(config_file, os.path.join(exp_path, args.version+'.yaml'))
+
+def add_gaussian2(model, sigma=0.05):
+    with torch.no_grad():
+        for _, param in model.named_parameters():
+            param_size = param.size()
+            mean_param = torch.zeros(param_size, device=device)
+            std_param = sigma * torch.ones(param_size, device=device)
+            gaussian_noise = torch.normal(mean_param, std_param)
+            param.add_(gaussian_noise)
 
 
 def train(starting_epoch, model, optimizer, scheduler, criterion, trainer, evaluator, ENV, data_loader):
@@ -233,12 +244,14 @@ def universal_perturbation(noise_generator, trainer, evaluator, model, criterion
     return random_noise
 
 
-def samplewise_perturbation_eval(random_noise, data_loader, model, eval_target='train_dataset', mask_cord_list=[]):
+def samplewise_perturbation_eval(random_noise, data_loader, model, criterion, eval_target='train_dataset', mask_cord_list=[]):
+    # modify this 
     loss_meter = util.AverageMeter()
     err_meter = util.AverageMeter()
     # random_noise = random_noise.to(device)
     model = model.to(device)
     idx = 0
+    loss_sharp = 0
     for i, (images, labels) in enumerate(data_loader[eval_target]):
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         if random_noise is not None:
@@ -259,7 +272,14 @@ def samplewise_perturbation_eval(random_noise, data_loader, model, eval_target='
         loss = torch.nn.CrossEntropyLoss()(pred, labels)
         loss_meter.update(loss.item(), len(labels))
         err_meter.update(err / len(labels))
-    return loss_meter.avg, err_meter.avg
+        for _ in range(20): #estimate expected loss
+            net_clone = copy.deepcopy(model).to(device)
+            add_gaussian2(net_clone) #add gaussian noise to model parameters
+            output_p = net_clone(images)
+            loss_s = criterion(output_p, labels)
+            loss_sharp += loss_s
+    loss_sharp = loss_sharp/(20*len(data_loader[eval_target]))
+    return loss_meter.avg, err_meter.avg, loss_sharp
 
 
 def sample_wise_perturbation(noise_generator, trainer, evaluator, model, criterion, optimizer, scheduler, random_noise, ENV):
@@ -290,7 +310,9 @@ def sample_wise_perturbation(noise_generator, trainer, evaluator, model, criteri
     train_idx = 0
     data_iter = iter(data_loader['train_dataset'])
     logger.info('=' * 20 + 'Searching Samplewise Perturbation' + '=' * 20)
+    craft_epochs = 0 #use epoch to control the effect
     while condition:
+        print('Crafting epochs:', craft_epochs)
         if args.attack_type == 'min-min' and not args.load_model:
             # Train Batch for min-min noise
             for j in tqdm(range(0, args.train_step), total=args.train_step):
@@ -363,18 +385,20 @@ def sample_wise_perturbation(noise_generator, trainer, evaluator, model, criteri
                 else:
                     random_noise[batch_start_idx+i] = delta.detach().cpu().numpy()
 
-        # Eval termination conditions
-        loss_avg, error_rate = samplewise_perturbation_eval(random_noise, data_loader, model, eval_target='train_dataset',
+        # Eval termination conditions, modify this to epochs
+        loss_avg, error_rate, loss_sharp = samplewise_perturbation_eval(random_noise, data_loader, model,criterion, eval_target='train_dataset',
                                                             mask_cord_list=mask_cord_list)
-        logger.info('Loss: {:.4f} Acc: {:.2f}%'.format(loss_avg, 100 - error_rate*100))
-
-        if torch.is_tensor(random_noise):
-            random_noise = random_noise.detach()
-            ENV['random_noise'] = random_noise
-        if args.attack_type == 'min-min':
-            condition = error_rate > args.universal_stop_error
-        elif args.attack_type == 'min-max':
-            condition = error_rate < args.universal_stop_error
+        logger.info('Loss: {:.4f} Acc: {:.2f}%  Sharpness :{:.4f}'.format(loss_avg, 100 - error_rate*100, loss_sharp))
+        
+        craft_epochs += 1
+        condition = (craft_epochs <= args.epochs)
+        # if torch.is_tensor(random_noise):
+        #     random_noise = random_noise.detach()
+        #     ENV['random_noise'] = random_noise
+        # if args.attack_type == 'min-min':
+        #     condition = error_rate > args.universal_stop_error
+        # elif args.attack_type == 'min-max':
+        #     condition = error_rate < args.universal_stop_error
 
     # Update Random Noise to shape
     if torch.is_tensor(random_noise):
